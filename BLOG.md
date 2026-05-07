@@ -9,11 +9,11 @@
 > vendor's Iceberg REST catalog, and then, on the Snowflake side, from
 > Databricks via Unity Catalog Federation.
 
-The two vendors take fundamentally different approaches and produce
-different observable results — different enough that anyone planning a
-multi-engine architecture on top of either platform should know exactly
-which behavior they're signing up for. This post walks through the test,
-the mechanism, and the implications.
+The two vendors take different approaches in how they fail-secure
+external readers and in *which* external readers they support, and the
+differences matter for any team planning a multi-engine architecture
+on top of either platform. This post walks through the test, the
+mechanism, and the implications.
 
 The full code and SQL is on GitHub:
 **[`uc-vs-horizon-iceberg-fgac`](https://github.com/sfc-gh-palapaty/uc-vs-horizon-iceberg-fgac)**.
@@ -41,65 +41,19 @@ Iceberg the way their marketing implies, is the same: the external Spark
 client should get back a *governed* view of the table — 3 rows, masked
 email, masked IP.
 
-That's what happens on Snowflake Horizon. On Databricks Unity Catalog the
-result is materially different.
-
----
-
-## The Snowflake Horizon side
-
-Setup, abridged:
-
-```sql
--- Snowflake-managed Iceberg table, accessible via Polaris REST.
-CREATE OR REPLACE ICEBERG TABLE demo.public.policy_test_table (...)
-  CATALOG = 'SNOWFLAKE'
-  EXTERNAL_VOLUME = 'my_s3_volume'
-  BASE_LOCATION = 'policy_test_table';
-
--- Row access policy: non-admin role sees only US/CA rows.
-CREATE OR REPLACE ROW ACCESS POLICY p_country_us_ca
-  AS (c STRING) RETURNS BOOLEAN ->
-    CURRENT_ROLE() = 'ACCOUNTADMIN' OR c IN ('US','CA');
-
--- Column masks.
-CREATE OR REPLACE MASKING POLICY mask_email AS (v STRING) RETURNS STRING ->
-  CASE WHEN CURRENT_ROLE() = 'ACCOUNTADMIN' THEN v
-       ELSE LEFT(v, 1) || '***' || SUBSTRING(v, POSITION('@' IN v)) END;
-
-ALTER ICEBERG TABLE demo.public.policy_test_table
-  ADD ROW ACCESS POLICY p_country_us_ca ON (country);
-ALTER ICEBERG TABLE demo.public.policy_test_table
-  MODIFY COLUMN email      SET MASKING POLICY mask_email;
-ALTER ICEBERG TABLE demo.public.policy_test_table
-  MODIFY COLUMN ip_address SET MASKING POLICY mask_ip;
-```
-
-OSS Spark configures its catalog against Snowflake Polaris with
-`scope=session:role:<role>`:
-
-```python
-.config("spark.sql.catalog.horizon.uri", f"{SF_URL}/polaris/api/catalog")
-.config("spark.sql.catalog.horizon.scope", f"session:role:{role}")
-.config("spark.sql.catalog.horizon.credential", PAT_TOKEN)
-.config("spark.sql.catalog.horizon.header.X-Iceberg-Access-Delegation", "vended-credentials")
-```
-
-`SELECT * FROM horizon.demo.public.policy_test_table` as `ACCOUNTADMIN`
-returns all 8 rows, raw. The same query as a non-admin role returns 3 rows
-with `a***@example.com` and `***.***.***.10`. The Spark process is
-unmodified between the two runs — only the role on the catalog scope
-changes. Horizon's policy enforcement happens server-side in Snowflake's
-data plane and is presented to Polaris as the canonical view of the table.
-The external engine sees the governed data.
-
-That's the result everyone expects. Now the other side.
+What actually happens is more interesting: **both vendors fail-secure
+on the pure Iceberg REST path**. Neither serves a governed view to a
+plain Apache Iceberg client when row-access or column-mask policies
+are attached. They differ in *how* they fail-secure (HTTP 403 vs
+response stripping) and in *which alternative paths* they offer for
+external compute that wants to read the same table while honoring the
+policies.
 
 ---
 
 ## The Databricks Unity Catalog side
 
-Setup is the equivalent SQL:
+Setup:
 
 ```sql
 CREATE TABLE <catalog>.policy_test.policy_test_table (
@@ -166,9 +120,7 @@ QUERY FAILED: Py4JJavaError: An error occurred while calling o62.showString.
 That error doesn't look like a Unity Catalog policy decision at first
 glance — it looks like an Iceberg client bug. It isn't.
 
----
-
-## What UC actually does — peek at the REST response
+### What UC actually does — peek at the REST response
 
 The most honest way to see what's happening is to skip Spark entirely and
 hit UC's Iceberg REST endpoint directly with `curl`:
@@ -184,6 +136,7 @@ A few key fields, side by side:
 
 | Field in `loadTable` response                | Phase A (no policies)                        | Phase B (policies attached)        |
 |---                                           |---                                           |---                                 |
+| HTTP status                                  | 200 OK                                       | **200 OK**                         |
 | `config.s3.access-key-id`                    | PRESENT                                      | **ABSENT**                         |
 | `config.s3.session-token`                    | PRESENT                                      | **ABSENT**                         |
 | `config.client.region`                       | PRESENT                                      | **ABSENT**                         |
@@ -205,43 +158,319 @@ authorization decision.
 
 ---
 
-## Why the two systems diverge
+## The Snowflake Horizon side
 
-The split is structural, not a feature gap that's about to be closed:
+Setup, abridged:
 
-### Snowflake Horizon — *enforce on the data plane*
+```sql
+-- Snowflake-managed Iceberg table, accessible via Polaris REST.
+CREATE OR REPLACE ICEBERG TABLE demo.public.policy_test_table (...)
+  CATALOG = 'SNOWFLAKE'
+  EXTERNAL_VOLUME = 'my_s3_volume'
+  BASE_LOCATION = 'policy_test_table';
 
-Snowflake's data plane stores Iceberg metadata that already reflects the
-caller's policy view. When an external client asks Polaris for the table,
-Snowflake produces a snapshot whose manifest list and data files
-correspond to the filtered, masked view that role would have seen
-in-warehouse. The credentials Polaris vends are scoped to those filtered
-files. Spark reads parquet from S3 and gets back governed data.
+-- Row access policy: non-admin role sees only US/CA rows.
+CREATE OR REPLACE ROW ACCESS POLICY p_country_us_ca
+  AS (c STRING) RETURNS BOOLEAN ->
+    CURRENT_ROLE() = 'ACCOUNTADMIN' OR c IN ('US','CA');
 
-This works because Snowflake's data layout for Iceberg is a result of its
-query planner, not the raw underlying files. The query planner is the
-same code path whether the consumer is a Snowflake virtual warehouse or
-an external client.
+-- Column masks.
+CREATE OR REPLACE MASKING POLICY mask_email AS (v STRING) RETURNS STRING ->
+  CASE WHEN CURRENT_ROLE() = 'ACCOUNTADMIN' THEN v
+       ELSE LEFT(v, 1) || '***' || SUBSTRING(v, POSITION('@' IN v)) END;
 
-### Databricks Unity Catalog — *enforce on the engine*
+ALTER ICEBERG TABLE demo.public.policy_test_table
+  ADD ROW ACCESS POLICY p_country_us_ca ON (country);
+ALTER ICEBERG TABLE demo.public.policy_test_table
+  MODIFY COLUMN email      SET MASKING POLICY mask_email;
+ALTER ICEBERG TABLE demo.public.policy_test_table
+  MODIFY COLUMN ip_address SET MASKING POLICY mask_ip;
+```
 
-Unity Catalog enforces row filters and column masks by **rewriting query
-plans inside Databricks compute**. The base table on S3 is unchanged: it's
-still all 8 rows, raw. UC adds the policy at query time, in the engine,
-in a name-based access path (`SELECT * FROM catalog.schema.table` rather
-than `spark.read.format("delta").load("s3://…")`).
+OSS Spark configures its catalog against Snowflake Polaris with
+`scope=session:role:<role>`:
 
-OSS Spark via Iceberg REST cannot be made to honor that. The client gets
-a metadata pointer plus credentials, plans the scan itself, and reads
-parquet directly from S3. UC has no opportunity to rewrite the plan.
+```python
+.config("spark.sql.catalog.horizon.uri", f"{SF_URL}/polaris/api/catalog")
+.config("spark.sql.catalog.horizon.scope", f"session:role:{role}")
+.config("spark.sql.catalog.horizon.credential", PAT_TOKEN)
+.config("spark.sql.catalog.horizon.header.X-Iceberg-Access-Delegation", "vended-credentials")
+```
 
-So UC has two choices when an external client asks for a policied table:
-**(a)** vend credentials anyway and watch the policies be silently
-bypassed, or **(b)** refuse to vend a usable response. UC chose (b), and
-chose to do it by stripping the response rather than returning a 403.
-That's a defensible security decision and a poor developer-experience
-decision: the failure is invisible at the HTTP layer and surfaces only
-as an Iceberg-client exception that doesn't mention authorization.
+### Phase A — no policies attached yet
+
+`SELECT * FROM horizon.demo.public.policy_test_table` as `ACCOUNTADMIN`
+returns all 8 rows, raw. Polaris's `loadTable` returns vended S3
+credentials and a real `manifest-list` pointer; the Iceberg client
+plans the scan and reads parquet directly. Same wire path as the
+Databricks Phase A — works fine on an unpoliced Snowflake-managed
+Iceberg table.
+
+### Phase B — same table, after attaching the row filter and column masks
+
+OSS Spark, hitting Polaris with the OAuth scope bound to *any*
+Snowflake role — `ACCOUNTADMIN`, the role the policies explicitly
+exempt, included — fails:
+
+```
+QUERY FAILED: Py4JJavaError: An error occurred while calling o63.sql.
+: org.apache.iceberg.exceptions.ForbiddenException: Forbidden: Authorization failed
+    at org.apache.iceberg.rest.ErrorHandlers$DefaultErrorHandler.accept(ErrorHandlers.java:236)
+    at org.apache.iceberg.rest.ErrorHandlers$TableErrorHandler.accept(ErrorHandlers.java:123)
+    at org.apache.iceberg.rest.HTTPClient.throwFailure(HTTPClient.java:215)
+    at org.apache.iceberg.rest.RESTSessionCatalog.loadTable(RESTSessionCatalog.java:397)
+    ...
+```
+
+The OAuth token exchange against `/polaris/api/catalog/v1/oauth/tokens`
+*succeeds* — Polaris issues a JWT bound to the role on the OAuth scope.
+What gets refused is the next call: `loadTable`. Polaris returns HTTP
+403 with body:
+
+```json
+{"error": {"message": "Authorization failed",
+           "type":    "ForbiddenException",
+           "code":    403}}
+```
+
+To verify the 403 is policy-driven and not account-/role-/network-driven,
+the same OAuth bearer was used to call `loadTable` against a sibling
+table in the same database that has *no* policies attached:
+
+```text
+=== loadTable on <non_policied_table>  (no policies attached) ===
+config keys              : ['client.region', 'expiration-time', 's3.access-key-id',
+                            's3.secret-access-key', 's3.session-token']
+vended S3 access-key-id  : PRESENT
+vended S3 session-token  : PRESENT
+snapshot.manifest-list   : 's3://<bucket>/<prefix>/<table>/metadata/snap-<id>.avro'
+
+=== loadTable on <policy_test_table>   (policies attached) ===
+ERROR: {"error": {"message": "Authorization failed",
+                  "type":    "ForbiddenException", "code": 403}}
+```
+
+Same OAuth token, same role, same vended-credentials header, same
+Polaris endpoint, same database/schema. Only difference: one table
+has FGAC policies attached, the other doesn't. **The policied one is
+refused at the REST layer.** Polaris does not attempt to serve a
+"role-scoped governed snapshot" — there is no metadata returned at
+all.
+
+So the empirical reality on the pure Apache Iceberg REST path is:
+
+> Both vendors fail-secure when an external Iceberg-spec client tries
+> to read a managed Iceberg table that has row-access or column-mask
+> policies attached. UC stripts the response body to 200 OK with empty
+> fields; Polaris returns 403. The table is unreadable from a pure
+> Iceberg-REST consumer either way.
+
+### The Snowflake Spark connector path
+
+The story doesn't end there for OSS Spark. Snowflake also ships a
+Spark connector — `net.snowflake:spark-snowflake_2.12` — that
+includes a hybrid catalog implementation, `SnowflakeFallbackCatalog`.
+This catalog wraps Iceberg's `SparkCatalog` and adds two enforcement-
+aware mechanisms for reaching policy-protected tables:
+
+1. The **Iceberg REST Scan API** (server-side scan planning), with
+   Iceberg 1.11+ on the Spark side. Instead of calling `loadTable`,
+   Spark calls Polaris's scan-planning endpoint; Polaris evaluates the
+   policies for the active role and returns concrete data-file
+   references that already reflect the row filter and column masks.
+   Spark reads only those files. This is the protocol-level escape
+   hatch the Iceberg REST spec was extended to provide for exactly
+   this scenario.
+2. **JDBC pushdown to a Snowflake virtual warehouse**, as a fallback
+   when the Scan API path isn't available for the client or table
+   layout. The SQL engine evaluates the policies at query time and
+   returns the governed rows over JDBC.
+
+Both paths are role-bound:
+
+```python
+.config("spark.sql.catalog.h",            "org.apache.spark.sql.snowflake.catalog.SnowflakeFallbackCatalog")
+.config("spark.sql.catalog.h.catalog-impl","org.apache.iceberg.spark.SparkCatalog")
+.config("spark.sql.catalog.h.type",        "rest")
+.config("spark.sql.catalog.h.uri",         f"{SF_URL}/polaris/api/catalog")
+.config("spark.sql.catalog.h.scope",       f"session:role:{role}")  # role-binds the Iceberg path
+
+.config("spark.snowflake.sfRole",          role)                    # role-binds the JDBC fallback
+.config("spark.snowflake.sfWarehouse",     "<warehouse>")
+.config("spark.snowflake.sfPassword",      PAT_TOKEN)
+.config("spark.snowflake.sfURL",           "<account>.snowflakecomputing.com")
+```
+
+`SELECT * FROM h.public.policy_test_table` as `ACCOUNTADMIN` returns
+the full 8 rows, raw. As the restricted role, the same query returns
+3 rows (US/CA only) with masked email and masked IP — exactly what
+the role would see in-warehouse:
+
+```
++-------+------------------+-------------+--------------+------------+------------+-------------------+
+|USER_ID|EMAIL             |FULL_NAME    |IP_ADDRESS    |COUNTRY_CODE|LOGIN_METHOD|EVENT_TIMESTAMP    |
++-------+------------------+-------------+--------------+------------+------------+-------------------+
+|1      |a***@example.com  |Alice Johnson|***.***.***.10|US          |SSO         |...                |
+|2      |b***@example.com  |Bob Smith    |***.***.***.25|CA          |MFA         |...                |
+|5      |e***@example.com  |Eve Davis    |***.***.***.10|US          |MFA         |...                |
++-------+------------------+-------------+--------------+------------+------------+-------------------+
+```
+
+Querying `INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER` immediately after
+the run shows the read actually executed on a Snowflake virtual
+warehouse:
+
+```
+SELECT "USER_ID", "EMAIL", "FULL_NAME", "IP_ADDRESS", "COUNTRY_CODE",
+       "LOGIN_METHOD", "EVENT_TIMESTAMP"
+FROM   PUBLIC.policy_test_table     -- ROLE_NAME=<restricted_role>, WAREHOUSE=<warehouse>
+SELECT "USER_ID", "EMAIL", "FULL_NAME", "IP_ADDRESS", "COUNTRY_CODE",
+       "LOGIN_METHOD", "EVENT_TIMESTAMP"
+FROM   PUBLIC.policy_test_table     -- ROLE_NAME=ACCOUNTADMIN,        WAREHOUSE=<warehouse>
+```
+
+That literal `SELECT "USER_ID", "EMAIL", … FROM PUBLIC.…` shape is the
+Snowflake Spark connector's JDBC pushdown signature. Our test pins
+`iceberg-spark-runtime-3.5_2.12:1.9.1`, which is pre-Scan-API on
+the Iceberg-runtime side, so for this run the connector took path 2
+(JDBC fallback) for both phases. With a newer Iceberg runtime that
+supports server-side scan planning, the connector would prefer path 1
+(Scan API) and the warehouse query history would look very different
+(metadata-shaped rather than full SELECT) — but the user-visible
+result is the same governed view either way.
+
+For non-policied tables on the same connector, the plain Iceberg REST
+path *does* succeed — the connector takes the cheap route there and
+reads parquet directly with vended creds and no warehouse spin-up.
+The routing is adaptive: pick whichever path the catalog will
+actually serve under the current policy state.
+
+Captured run output:
+[`snowflake/findings_pure_iceberg_rest.md`](https://github.com/sfc-gh-palapaty/uc-vs-horizon-iceberg-fgac/blob/main/snowflake/findings_pure_iceberg_rest.md)
+(the 403 path) and
+[`snowflake/findings_snowflake_spark_connector.md`](https://github.com/sfc-gh-palapaty/uc-vs-horizon-iceberg-fgac/blob/main/snowflake/findings_snowflake_spark_connector.md)
+(the connector path).
+
+---
+
+## Why the two systems behave the way they do
+
+### Both fail-secure at the pure Iceberg REST boundary
+
+Row-access and column-mask policies on a managed Iceberg table are
+**query-time** constructs: Snowflake's row-access policies are SQL
+expressions evaluated by Snowflake's planner; Databricks's row filters
+and column masks are UDFs the UC engine wraps around the relation
+before scanning it. Neither set of policies is encoded into the
+parquet files. The parquet files are still the raw, complete dataset.
+
+So when an external Iceberg-spec client asks for the table via the
+catalog's REST endpoint, the platform has three theoretical options:
+
+1. **Vend creds + metadata pointing at the raw files anyway**, watch
+   the policies be silently bypassed. Both vendors *deliberately do
+   not* do this. (And as the Catalog Federation case below shows,
+   when something else does end up in this position, the bypass is
+   real.)
+2. **Synthesize a governed snapshot** — write fresh manifest files
+   that reference only the rows/columns the role should see, vend
+   creds scoped to those files, and serve that snapshot back. This is
+   the elegant option in theory, but it requires non-trivial machinery
+   per request — masking is a column-level rewrite that doesn't fit
+   the Iceberg snapshot model cleanly, and row filters on dynamic
+   `CURRENT_ROLE()` predicates would need a fresh snapshot per role.
+   Neither vendor does this today.
+3. **Fail-secure: refuse the `loadTable` request.** Both vendors took
+   this path on the standard Iceberg REST `loadTable` flow. They
+   differ only in the protocol shape:
+
+   | | Databricks UC | Snowflake Polaris |
+   |---|---|---|
+   | HTTP status | 200 OK | 403 Forbidden |
+   | Response body | full table metadata, but `manifest-list = ""` and no vended S3 creds | `{"error": {"message": "Authorization failed", "type": "ForbiddenException", "code": 403}}` |
+   | What the Iceberg client surfaces | `ValidationException: Invalid S3 URI, cannot determine scheme:` (downstream) | `ForbiddenException: Authorization failed` (direct) |
+   | Honesty of the failure | low — looks like a malformed table | high — explicit `Forbidden` from the protocol |
+
+The Snowflake form is more transparent at the protocol level; the UC
+form is older and surfaces only as a downstream client exception.
+Operationally they have the same effect on this flow: an Iceberg-spec
+client that uses `loadTable` cannot read raw parquet for a policied
+table.
+
+This is independently corroborated from a completely different
+client. [duckdb/duckdb-iceberg#977](https://github.com/duckdb/duckdb-iceberg/issues/977)
+reports DuckDB 1.5.2 (with the Iceberg extension) hitting Snowflake's
+HIRC endpoint and getting `HTTP Forbidden_403` with message
+`Authorization failed` on `GetTableInformation` — the exact same 403
+our PySpark client got, from a totally different Iceberg
+implementation. So the 403 is a property of the catalog + the
+table's policy state, not of any one client's wiring.
+
+### The Scan API is the protocol's escape hatch — and Snowflake implements it
+
+There's a fourth option the Iceberg community standardized
+specifically for this case, and Snowflake implements it: the
+**Iceberg REST Scan API**, also known as server-side scan planning.
+Instead of `loadTable` returning a snapshot pointer plus credentials
+and letting the client plan its own scan, the catalog server itself
+does the scan planning. It evaluates the policies for the active
+role, computes the set of data-file references that the role is
+allowed to see (already filtered, already masked), and returns that
+list to the client. The client then reads only the listed files.
+Polaris implements this for Snowflake-managed Iceberg tables; Spark
+with Iceberg 1.11+ supports it on the client side; Snowflake's Spark
+connector takes advantage of it.
+
+So the more nuanced statement of what's happening on the Snowflake
+side is:
+
+- An Iceberg-spec client that uses **only `loadTable`** gets the
+  fail-secure 403. (Older Spark+Iceberg, DuckDB 1.5.2, anything that
+  predates server-side scan planning.)
+- An Iceberg-spec client that **also uses the Scan API** gets a
+  governed-snapshot-equivalent: a list of data files that already
+  reflect the policy, vended credentials scoped to those files, and
+  reads parquet directly from S3. No Snowflake compute used; the
+  policy is enforced by Polaris during scan planning.
+
+UC's documented Iceberg REST endpoint does not currently advertise a
+comparable Scan API path for policied tables. So the asymmetry is
+narrower and sharper than "Snowflake fails-secure too": both vendors
+fail-secure on `loadTable`, but Snowflake offers a documented
+Iceberg-protocol-compliant way for adopting clients to read the
+policied table; UC effectively requires consumers to be Databricks
+compute itself.
+
+### Summary of the alternative paths for external compute
+
+Putting the `loadTable` story and the Scan API story together for the
+Snowflake side, an external Iceberg-spec consumer of a policied
+Snowflake-managed table actually has three protocol-level paths
+available depending on its capabilities:
+
+| Client capability | Path used | Where the policy is enforced | Outcome on a policied table |
+|---|---|---|---|
+| `loadTable` only (Iceberg <= 1.10, DuckDB 1.5.2, most pure-Iceberg-REST clients today) | Iceberg REST `loadTable` | n/a — request refused | **403 Forbidden** |
+| Iceberg REST Scan API (Iceberg 1.11+ on Spark, Snowflake Spark connector) | Iceberg REST scan planning | Polaris during scan planning, returns role-scoped data-file list + scoped vended creds | **Governed read**, no Snowflake compute |
+| Snowflake Spark connector with JDBC fallback enabled | JDBC pushdown to a Snowflake warehouse | Snowflake SQL engine at query time | **Governed read**, on Snowflake compute |
+
+UC does not document a comparable Scan API or connector-fallback path
+today for policied tables. The supported consumers of a UC-managed
+policied table are Databricks compute itself (interactive cluster, SQL
+warehouse, Databricks Connect) via name-based SQL. Path-based access
+(`spark.read.format("delta").load("s3://…")`), the Iceberg REST path,
+and any other path that bypasses the engine are all blocked or
+unsupported on policied tables.
+
+So both vendors fail-secure on `loadTable`. Snowflake additionally
+implements the Iceberg REST spec's standardized escape hatch for
+policied tables (Scan API) and offers the Snowflake Spark connector
+as a JDBC-based fallback. The size of the multi-engine governance
+story therefore depends as much on *which Iceberg client you're
+using* as on which platform you're querying: a Spark-1.11+/connector
+client lands in the governed-read column on Snowflake; a
+`loadTable`-only client lands in the 403 column on Snowflake (and in
+the equivalent fail-secure column on UC).
 
 The behavior is documented:
 
@@ -268,49 +497,55 @@ the foreseeable future.
 
 ## Implications for multi-engine architectures
 
-Plenty of teams reach for managed Iceberg specifically because they want a
-single governance plane that works across compute engines: Spark on EMR,
-Trino, Flink, PyIceberg in scripts, Snowflake reading via catalog-linked
-databases, and so on. The two vendors offer fundamentally different
-contracts for that scenario:
+Plenty of teams reach for managed Iceberg specifically because they
+want a single governance plane that works across compute engines:
+Spark on EMR, Trino, Flink, PyIceberg in scripts, DuckDB in
+notebooks, Snowflake reading via catalog-linked databases, and so
+on. The empirical results above narrow the design space along two
+axes — which Iceberg flow the client implements, and which platform
+governs the table:
 
-- **Snowflake Horizon** treats the data plane as the enforcement plane.
-  Any external Iceberg client gets the governed view. Multi-engine and
-  fine-grained access control are not mutually exclusive — you can have
-  governance and openness at the same time.
-- **Databricks Unity Catalog** treats the engine as the enforcement
-  plane. As soon as you attach a row filter or column mask to a table,
-  that table effectively becomes Databricks-only: it's still readable
-  from Databricks compute via name-based access, but unreadable from any
-  external Iceberg client. You have to pick between governance and
-  multi-engine access on a per-table basis.
-
-That last point is the headline. UC FGAC is not a free lunch on top of
-"open Iceberg". It is a feature that is incompatible with a class of
-external consumers that the Iceberg REST endpoint nominally exists to
-serve.
-
-The usual workarounds — expose dynamic views with the policy logic
-baked in, copy the table into a separate location for external
-consumption, restrict external consumers to columns and rows you don't
-need to mask — re-introduce exactly the duplication and surface area
-that motivated putting FGAC on the base table in the first place.
-
-If your design assumes UC as the single source of truth and external
-engines are first-class consumers, this needs to be on the table early.
+- **Plain `loadTable`-based Iceberg clients** (Spark with
+  `type=rest`, PyIceberg, Trino's Iceberg REST connector,
+  DuckDB, anything that hasn't adopted server-side scan planning)
+  **cannot read a policied managed Iceberg table on either platform**.
+  Both UC and Polaris fail-secure on `loadTable` itself. The
+  duckdb-iceberg issue
+  ([#977](https://github.com/duckdb/duckdb-iceberg/issues/977))
+  documents this exact failure for DuckDB against Snowflake's HIRC.
+  This is the dominant client capability in the field today, so for
+  practical purposes "FGAC + arbitrary Iceberg client = unreadable"
+  is the right operational assumption right now.
+- **Iceberg clients that implement server-side scan planning (Scan
+  API)** — Spark 3.5+ on Iceberg 1.11+, the Snowflake Spark connector
+  — **can read a policied Snowflake-managed Iceberg table** and get a
+  governed result back. This is an Iceberg-spec-compliant flow, not
+  Snowflake-proprietary; the catalog-side bottleneck is which
+  vendors implement it, and the client-side bottleneck is Iceberg
+  client adoption. UC doesn't currently advertise a Scan API path
+  for policied tables, so this option doesn't exist on the UC side.
+- **External compute that re-enters the governing engine** can read
+  the table even without Scan API support — JDBC pushdown to
+  Snowflake (via the Snowflake Spark connector or Databricks Query
+  Federation), or name-based SQL on Databricks compute (interactive
+  cluster, SQL warehouse, Databricks Connect). The security boundary
+  here is the governing engine's SQL evaluator, not the Iceberg REST
+  layer.
+- **The trap** is *external compute that can reach the parquet files
+  directly* without re-entering the governing engine and without
+  going through Scan API. That path bypasses the policies entirely,
+  because the policies are query-time constructs and the parquet
+  files have no idea they exist. Catalog Federation, AWS Glue,
+  Hadoop catalog, and any reader with independent credentials to the
+  underlying bucket are all in this category. The Catalog Federation
+  case below makes this concrete.
 
 ---
 
 ## A twist: Snowflake-policied table read from Databricks via UC Federation
 
-Once you've internalized the difference, the obvious follow-up question
-is the inverse one: if Snowflake is the governance plane and the table
-sits in S3 in a Snowflake-managed Iceberg format, what does *Databricks*
-see when it queries that table?
-
-This matters because Databricks customers don't have to use OSS Spark to
-reach a Snowflake-managed table. UC offers two first-class integrations
-into Snowflake — and they take dramatically different paths to the data.
+UC offers two first-class integrations into Snowflake — and they take
+dramatically different paths to the data.
 
 ### Path 1 — Query Federation (JDBC pushdown)
 
@@ -341,7 +576,10 @@ SELECT * FROM sf_query_fed.public.policy_test_table ORDER BY user_id;
 
 Three rows, masked. Identical to what Snowflake itself returns to the
 restricted role. Snowflake's policies are honored because Snowflake's
-query engine is in the data path.
+query engine is in the data path. This is essentially the same shape
+as the Snowflake-Spark-connector / `SnowflakeFallbackCatalog` JDBC
+fallback path, just with Databricks playing the role of the Spark
+driver.
 
 ### Path 2 — Catalog Federation (direct S3 read)
 
@@ -395,12 +633,14 @@ both ACCOUNTADMIN and the non-admin role; same path. UC then reads the
 parquet directly using its own storage credential. Snowflake's FGAC
 enforcement is no longer in the path, so it doesn't apply.
 
-This is the architectural inverse of UC's own behavior. UC's Iceberg
-REST endpoint scrubs `loadTable` for policied tables and refuses to
-hand the raw parquet to external readers — fail-secure. Snowflake's
-metadata service does not scrub; it trusts the engine to honor the
-policy at query time, which works for Snowflake compute but not for an
-engine that bypasses the engine.
+This is a notable asymmetry. Polaris, asked through the Iceberg REST
+endpoint, *refuses* to serve any external Iceberg-REST client a
+policied table — fail-secure HTTP 403, per the Snowflake-side test
+above. But Snowflake's *metadata service* does not redact the parquet
+location returned over JDBC: it trusts Snowflake's own engine to
+honor the policy at query time, which works for Snowflake compute but
+not for an engine that reads the parquet directly. Catalog Federation
+exploits exactly that gap.
 
 ### Fallback mode is a safety net, not the rule
 
@@ -419,12 +659,12 @@ FGAC is not protecting that path.
 
 ### Summary
 
-| Snowflake policy | Direct in Snowflake | Snowflake → OSS Spark via Polaris | Snowflake → Databricks Query Federation | Snowflake → Databricks Catalog Federation |
-|---|---|---|---|---|
-| Row-access policy | Enforced | Enforced (governed snapshot) | Enforced (JDBC pushdown) | **Bypassed** |
-| Email masking policy | Enforced | Enforced | Enforced | **Bypassed** |
-| IP masking policy | Enforced | Enforced | Enforced | **Bypassed** |
-| Provider on Databricks side | n/a | n/a | `snowflake` | `iceberg` |
+| Snowflake policy | Direct in Snowflake | Snowflake → OSS Spark, pure Iceberg REST | Snowflake → OSS Spark, Snowflake Spark connector | Snowflake → Databricks Query Federation | Snowflake → Databricks Catalog Federation |
+|---|---|---|---|---|---|
+| Row-access policy | Enforced | **Refused (403)** | Enforced (JDBC fallback) | Enforced (JDBC pushdown) | **Bypassed** |
+| Email masking policy | Enforced | **Refused (403)** | Enforced (JDBC fallback) | Enforced | **Bypassed** |
+| IP masking policy | Enforced | **Refused (403)** | Enforced (JDBC fallback) | Enforced | **Bypassed** |
+| Provider on Databricks side | n/a | n/a | n/a | `snowflake` | `iceberg` |
 
 Customers running Snowflake FGAC and considering Databricks as a reader
 should default to Query Federation, treat Catalog Federation as
@@ -450,7 +690,8 @@ databricks/                            snowflake/
 ├── 02_apply_row_filter_and_masks.sql  ├── 02_apply_policies.sql
 ├── 03_drop_policies.sql               ├── 03_drop_policies.sql
 ├── spark_uc_policy_test.py            ├── spark_horizon_policy_test.py
-└── probe_uc_iceberg_rest.sh           └── probe_polaris_iceberg_rest.sh
+└── probe_uc_iceberg_rest.sh           ├── spark_horizon_with_snowflake_connector.py
+                                       └── probe_polaris_iceberg_rest.sh
 ```
 
 ### Databricks side
@@ -470,7 +711,7 @@ python3 databricks/spark_uc_policy_test.py    # Phase A: 8 rows, raw
 # Step 3 (Databricks SQL editor): run databricks/02_apply_row_filter_and_masks.sql
 
 python3 databricks/spark_uc_policy_test.py    # Phase B: ValidationException: Invalid S3 URI
-./databricks/probe_uc_iceberg_rest.sh         # Phase B: BLOCKED
+./databricks/probe_uc_iceberg_rest.sh         # Phase B: BLOCKED (response scrubbed)
 
 # Optional cleanup: databricks/03_drop_policies.sql
 ```
@@ -490,17 +731,21 @@ export SNOWFLAKE_WAREHOUSE="<warehouse>"
 export SNOWFLAKE_REGION="us-east-1"
 export JAVA_HOME=$(/usr/libexec/java_home -v 11)
 
-# Phase A as the admin role
+# Phase A: BEFORE policies are attached. Pure Iceberg REST works.
 export SNOWFLAKE_ROLE=ACCOUNTADMIN
 python3 snowflake/spark_horizon_policy_test.py   # Phase A: 8 rows, raw
 ./snowflake/probe_polaris_iceberg_rest.sh        # Phase A: READABLE
 
 # Step 3 (Snowsight): run snowflake/02_apply_policies.sql
 
-# Phase B as the restricted role
-export SNOWFLAKE_ROLE=<restricted_role>          # e.g. POLICY_TEST_ANALYST
-python3 snowflake/spark_horizon_policy_test.py   # Phase B: 3 rows, MASKED email + IP
-./snowflake/probe_polaris_iceberg_rest.sh        # Phase B: READABLE (governed view)
+# Phase B: pure Iceberg REST -- now refused.
+python3 snowflake/spark_horizon_policy_test.py   # Phase B: ForbiddenException: Authorization failed
+./snowflake/probe_polaris_iceberg_rest.sh        # Phase B: BLOCKED (error.code=403)
+
+# Phase B alternative: Snowflake Spark connector with JDBC fallback.
+export SNOWFLAKE_RESTRICTED_ROLE=<restricted_role>
+python3 snowflake/spark_horizon_with_snowflake_connector.py
+# Phase A 8 rows raw, Phase B 3 rows masked -- governed result via JDBC.
 
 # Optional cleanup: snowflake/03_drop_policies.sql
 ```
@@ -535,33 +780,72 @@ Spark dependency download.
 "Iceberg is open" is true, and "Iceberg is governed" is true on both
 platforms. The interesting question is whether those two things are
 *compatible* on a per-table basis when a foreign engine is in the
-picture, *and* on which side of that engine boundary policies are
-actually enforced.
+picture — and the empirical answer has more nuance than the
+marketing on either side suggests.
 
-The two platforms make opposite choices, and both choices have
-consequences:
+The picture in three statements:
 
-- **Databricks Unity Catalog** treats the Databricks engine as the
-  enforcement plane. Policied tables are governed inside Databricks,
-  unreadable from an external Iceberg client. Fail-secure to outsiders;
-  closed to multi-engine reads on policied tables.
-- **Snowflake Horizon** treats the data plane as the enforcement plane
-  *for engines that go through Snowflake* (native compute, OSS Spark via
-  Polaris, Databricks Query Federation). Open to multi-engine reads.
-  But that openness has an edge: any path that hands raw S3 access to
-  another engine — like Databricks Catalog Federation — bypasses the
-  policies entirely, because they are query-time constructs and the
-  parquet files have no idea they exist.
+- **Both Databricks Unity Catalog and Snowflake Polaris fail-secure on
+  the standard Iceberg REST `loadTable` flow** for tables with
+  row-access or column-mask policies attached. UC scrubs the response
+  body to `200 OK` with empty fields; Polaris returns `403 Forbidden`.
+  Either way, the dominant class of Iceberg-spec clients in the field
+  today (anything `loadTable`-based — Spark+Iceberg ≤ 1.10,
+  PyIceberg, DuckDB, plain `type=rest` Spark catalogs) cannot read a
+  policied table on either platform. The DuckDB issue
+  ([duckdb-iceberg#977](https://github.com/duckdb/duckdb-iceberg/issues/977))
+  documents this for DuckDB+Snowflake; our test documents it for
+  PySpark+Iceberg-1.9.1 against both Snowflake and Databricks.
+- **The Iceberg REST spec has a standardized escape hatch — the
+  Scan API, server-side scan planning — and Snowflake implements it.**
+  Iceberg clients that adopt the Scan API (Spark 3.5+ on Iceberg 1.11+,
+  the Snowflake Spark connector) get a governed external read of a
+  policied Snowflake-managed table: Polaris evaluates the policy
+  during scan planning, returns role-scoped data-file references, and
+  the client reads those files directly. UC does not currently
+  advertise a comparable Scan API path for policied tables. So the
+  multi-engine governance story on Snowflake is real but
+  client-version-gated; on UC it requires Databricks compute itself.
+- **The trap, on either platform, is external compute that bypasses
+  the governing engine and reads the parquet directly.** Catalog
+  Federation does this for Snowflake-managed Iceberg tables: 8 raw
+  rows, unmasked, regardless of policies. Anything else that hands an
+  external engine raw cloud-storage access to the underlying files —
+  AWS Glue, Hadoop catalog, an Iceberg client with its own AWS
+  credentials, a synced Open Catalog instance — has the same shape.
+  Policies are query-time constructs; the parquet has no idea they
+  exist.
 
 The practical takeaway for anyone planning a multi-engine architecture
-is to be explicit about *which engine you trust to enforce policy at
-query time*, and then make sure every read path actually goes through
-that engine. UC gives you that for free if you stay on Databricks
-compute. Snowflake gives you that for free if you stay on Snowflake or
-on engines that talk to it through Snowflake compute (OSS Spark via
-Polaris, Databricks Query Federation). The traps are at the boundaries:
-external Iceberg clients hitting UC's REST endpoint, and Databricks
-Catalog Federation reading Snowflake-managed parquet directly.
+is to be explicit about three things at design time, not at incident
+time:
+
+1. **Which engine you trust to enforce policy at query time** — and
+   make sure every read path actually goes through that engine, or
+   through an Iceberg Scan API that the catalog implements
+   policy-aware.
+2. **Which Iceberg client capabilities your downstream consumers
+   actually have.** A "we pick managed Iceberg so any engine can
+   read" plan that targets Snowflake FGAC is realistic for clients
+   that adopt server-side scan planning, and unrealistic for clients
+   that don't. Inventory your consumers; check whether they're
+   `loadTable`-only or Scan-API-aware.
+3. **Which paths around the engine exist in your environment.** Audit
+   IAM on the underlying buckets, every `CONNECTION TYPE = SNOWFLAKE`
+   foreign catalog with `authorized_paths`, every Glue / Open Catalog
+   sync, every Iceberg client config that supplies its own cloud
+   credentials. Any of those is a bypass channel for FGAC, regardless
+   of how strict the catalog is.
+
+UC keeps you safe as long as you stay on Databricks compute and
+don't expose Iceberg REST to external readers of policied tables.
+Snowflake keeps you safe as long as you stay on Snowflake compute,
+or on Iceberg clients that adopt the Scan API, or on engines that
+talk to it through Snowflake compute (Snowflake Spark connector,
+Databricks Query Federation, JDBC). The boundaries where the
+guarantees stop are the same on both sides: pure-`loadTable` Iceberg
+clients (refused) and "go around the engine and read the parquet"
+paths (silently ungoverned).
 
 ---
 
@@ -574,9 +858,12 @@ Catalog Federation reading Snowflake-managed parquet directly.
 - Databricks docs — [Enable Snowflake catalog federation](https://docs.databricks.com/aws/en/query-federation/snowflake-catalog-federation)
 - Databricks KB — [Unauthorized access exception … row filters or column masks](https://kb.databricks.com/en_US/delta/unauthorized-access-exception-when-trying-to-access-a-unity-catalog-table-with-row-filters-or-column-masks)
 - Apache Iceberg — [Issue #10909 "Support row filter & column masking in REST spec"](https://github.com/apache/iceberg/issues/10909) (closed: `not_planned`)
+- Apache Iceberg — [REST OpenAPI spec including the scan-planning endpoints](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml) (server-side scan planning / Scan API)
+- DuckDB Iceberg extension — [Issue #977 "Support for Iceberg REST Catalog Scan API (server-side planning)"](https://github.com/duckdb/duckdb-iceberg/issues/977) — independent corroboration of Snowflake HIRC's 403 for policy-protected tables, plus the role of the Scan API as the protocol-level escape hatch
 - Snowflake docs — [Apache Iceberg tables](https://docs.snowflake.com/en/user-guide/tables-iceberg)
 - Snowflake docs — [Row access policies](https://docs.snowflake.com/en/user-guide/security-row-intro)
 - Snowflake docs — [Polaris (open-source) catalog](https://www.snowflake.com/blog/polaris-catalog-iceberg/)
+- Snowflake docs — [Snowflake Connector for Spark](https://docs.snowflake.com/en/user-guide/spark-connector)
 
 ---
 

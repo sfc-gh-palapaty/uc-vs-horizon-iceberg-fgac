@@ -3,25 +3,48 @@ spark_horizon_policy_test.py
 
 OSS Apache Spark client for the Snowflake Horizon side of the comparison.
 Connects to a Snowflake account's Polaris REST catalog and reads a
-Snowflake-managed Iceberg table, optionally as different roles.
+Snowflake-managed Iceberg table, optionally as different roles, using
+ONLY the Apache Iceberg REST spec (no Snowflake Spark connector, no
+JDBC fallback).
 
 Run this script twice:
 
   Phase A -- as the admin role (e.g. ACCOUNTADMIN), with no policies on
-            the table OR with the admin role exempt from the policy.
-            Expect: 8 rows, raw email + IP.
+            the table.
+            Expect: 8 rows, raw email + IP. Iceberg REST loadTable
+            succeeds, Polaris vends short-lived S3 credentials, Spark
+            reads parquet directly from S3.
 
-  Phase B -- as a non-admin role (e.g. POLICY_TEST_ANALYST), with the
-            row access policy and column masks applied (run
-            02_apply_policies.sql first).
-            Expect: 3 rows (US/CA only), email + IP masked. Snowflake
-            Horizon enforces the policy server-side and serves the
-            governed view of the table to the external Spark client
-            via Polaris with vended S3 credentials.
+  Phase B -- once row-access and/or column-mask policies are attached
+            (run 02_apply_policies.sql), re-run for any role -- admin
+            OR non-admin.
+            Expect (current behavior, captured in
+            findings_pure_iceberg_rest.md): the Iceberg REST call
+            FAILS with HTTP 403 -- Polaris refuses loadTable for a
+            policied Snowflake-managed Iceberg table to ANY external
+            Iceberg-REST caller while the policies are attached.
+            Spark surfaces this as:
+                org.apache.iceberg.exceptions.ForbiddenException:
+                Forbidden: Authorization failed
+            This is fail-secure behavior, conceptually the same shape
+            as Databricks Unity Catalog's response stripping. Pure
+            Iceberg-spec readers cannot consume a policied
+            Snowflake-managed Iceberg table from outside Snowflake
+            compute.
 
-Compare to the Databricks Unity Catalog side (../databricks/spark_uc_policy_test.py)
-where Phase B fails because UC strips vended credentials and the
-manifest-list pointer from the Iceberg REST loadTable response.
+To READ a policied Snowflake-managed Iceberg table from OSS Spark, use
+the Snowflake Spark connector instead (see
+spark_horizon_with_snowflake_connector.py). That client falls back to
+JDBC against a Snowflake virtual warehouse, where the SQL engine
+evaluates the policies for the active role and returns the governed
+result.
+
+Compare to the Databricks Unity Catalog side
+(../databricks/spark_uc_policy_test.py): Phase B there also fails, but
+with a different shape -- UC returns 200 OK with a scrubbed body
+(empty manifest-list, no vended creds), and the failure surfaces
+downstream as `Invalid S3 URI, cannot determine scheme:` from the
+Iceberg client. Snowflake's Polaris just returns HTTP 403 directly.
 
 ----------------------------------------------------------------------------
 Usage:
@@ -177,21 +200,33 @@ def main() -> None:
     print("  INTERPRETATION")
     print("=" * 80)
     print()
-    print("  Phase A (admin role, e.g. ACCOUNTADMIN):")
-    print("    OSS Spark sees 8 rows, fully unmasked. Snowflake's row access")
-    print("    policy and column masks exempt ACCOUNTADMIN.")
+    print("  Phase A (no policies attached):")
+    print("    OSS Spark reads the table normally via pure Iceberg REST.")
+    print("    Polaris's loadTable returns vended S3 credentials and a real")
+    print("    manifest-list pointer; Spark reads parquet directly from S3.")
+    print("    No Snowflake compute is used.")
     print()
-    print("  Phase B (restricted role, with policies attached):")
-    print("    OSS Spark sees 3 rows (US/CA only) with masked email + IP.")
-    print("    Snowflake Horizon enforces the policy server-side and serves")
-    print("    the governed view of the table to Polaris. The external Spark")
-    print("    client gets the same governed result the role would see")
-    print("    in-warehouse.")
+    print("  Phase B (row-access / column-mask policies attached):")
+    print("    OSS Spark request fails with HTTP 403:")
+    print("      org.apache.iceberg.exceptions.ForbiddenException:")
+    print("      Forbidden: Authorization failed")
+    print("    This is the same outcome for ANY role -- including")
+    print("    ACCOUNTADMIN, which the policies explicitly exempt. Polaris")
+    print("    refuses loadTable for a policied Snowflake-managed Iceberg")
+    print("    table at the REST boundary while the policies are attached.")
+    print("    To READ this policied table from OSS Spark, use the Snowflake")
+    print("    Spark connector path (see spark_horizon_with_snowflake_connector.py),")
+    print("    which falls back to JDBC where Snowflake compute applies the")
+    print("    policies and returns the governed result.")
     print()
-    print("  Compare to ../databricks/spark_uc_policy_test.py: in the")
-    print("  Databricks UC equivalent, Phase B fails entirely because UC")
-    print("  strips vended S3 credentials and the manifest-list pointer from")
-    print("  the loadTable response rather than enforcing policy.")
+    print("  Compare to ../databricks/spark_uc_policy_test.py: Phase B there")
+    print("  also fails, but with a different protocol shape -- UC returns")
+    print("  200 OK and scrubs the response body (empty manifest-list, no")
+    print("  vended creds), and the failure shows up downstream as:")
+    print("    org.apache.iceberg.exceptions.ValidationException:")
+    print("    Invalid S3 URI, cannot determine scheme:")
+    print("  Both vendors fail-secure for pure Iceberg-REST clients reading")
+    print("  policied tables, just at different layers of the protocol.")
     print()
 
 

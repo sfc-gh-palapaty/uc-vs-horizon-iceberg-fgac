@@ -9,15 +9,30 @@
 #   - storage-credentials[]
 #   - snapshot.manifest-list
 #
-# Run this as the admin role (Phase A) and then as a restricted role with
-# policies attached (Phase B). The contrast IS the demo:
+# Run this against the policy_test_table BEFORE applying policies
+# (Phase A) and then AFTER applying policies (Phase B). The contrast IS
+# the demo:
 #
-#   Phase A (admin):       vended creds PRESENT, real manifest-list -> READABLE
-#   Phase B (restricted):  vended creds PRESENT, manifest-list points
-#                          at the FILTERED + MASKED snapshot         -> READABLE
+#   Phase A (no policies attached):
+#     loadTable returns 200 OK with vended S3 creds and a real
+#     manifest-list pointer -> READABLE.
 #
-# Compare to ../databricks/probe_uc_iceberg_rest.sh, where Phase B returns
-# empty creds and an empty manifest-list (BLOCKED).
+#   Phase B (row-access / column-mask policies attached, any role):
+#     loadTable returns HTTP 403 ForbiddenException ("Authorization
+#     failed") -> BLOCKED. Polaris refuses to serve the table to ANY
+#     external Iceberg-REST caller -- including the admin role the
+#     policies explicitly exempt -- while the policies are attached.
+#
+# This is fail-secure behavior at the Iceberg REST boundary. The
+# contrast is now to the *non-policied* sibling: re-pointing
+# SNOWFLAKE_TABLE at any Snowflake-managed Iceberg table without
+# policies brings the loadTable response back to vended creds and a
+# real manifest-list.
+#
+# Compare to ../databricks/probe_uc_iceberg_rest.sh: UC also fail-
+# secures Phase B, but with a different protocol shape -- 200 OK with
+# the response body scrubbed (empty manifest-list, no vended creds)
+# instead of a 403.
 #
 # Required environment variables:
 #   SNOWFLAKE_ACCOUNT_URL   e.g. https://<account>.snowflakecomputing.com
@@ -46,17 +61,63 @@ echo "Table  : $SNOWFLAKE_DATABASE.$SCHEMA.$TABLE"
 echo "Role   : $SNOWFLAKE_ROLE"
 echo
 
-# Polaris REST API uses the OAuth2 'scope=session:role:<role>' convention
-# to bind the request to a specific Snowflake role. The catalog (Polaris
-# warehouse) name maps to the Snowflake database name.
-curl -s \
-  -H "Authorization: Bearer $SNOWFLAKE_PAT" \
+# Polaris REST OAuth: exchange the PAT for a role-scoped bearer using the
+# standard OAuth2 client_credentials grant. Polaris's
+# session:role:<role> scope binds the issued token to the given
+# Snowflake role for the duration of the request.
+TOKEN=$(curl -s -X POST "$ACCOUNT_URL/polaris/api/catalog/v1/oauth/tokens" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_secret=$SNOWFLAKE_PAT" \
+  --data-urlencode "scope=session:role:$SNOWFLAKE_ROLE" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('access_token','ERROR_'+str(d)))")
+
+if [[ "$TOKEN" == ERROR_* ]]; then
+  echo "OAuth token exchange failed:"
+  echo "$TOKEN" | sed 's/^ERROR_//'
+  exit 1
+fi
+
+# loadTable on the table.
+RESP=$(curl -s \
+  -H "Authorization: Bearer $TOKEN" \
   -H "X-Iceberg-Access-Delegation: vended-credentials" \
-  -H "Polaris-Role: $SNOWFLAKE_ROLE" \
-  "$ACCOUNT_URL/polaris/api/catalog/v1/$SNOWFLAKE_DATABASE/namespaces/$SCHEMA/tables/$TABLE" \
-  | python3 -c "
+  "$ACCOUNT_URL/polaris/api/catalog/v1/$SNOWFLAKE_DATABASE/namespaces/$SCHEMA/tables/$TABLE")
+
+echo "$RESP" | python3 -c "
 import json, sys
-d = json.load(sys.stdin)
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print('--- Polaris Iceberg REST loadTable response ---')
+    print('Non-JSON response:')
+    print(raw)
+    print()
+    print('Verdict for external Iceberg engine readability:')
+    print('   BLOCKED  (Polaris returned a non-JSON / error response)')
+    sys.exit(0)
+
+# Polaris returns 403 with a JSON error body for policied tables.
+err = d.get('error')
+if err is not None:
+    msg  = err.get('message') if isinstance(err, dict) else str(err)
+    code = err.get('code')    if isinstance(err, dict) else None
+    typ  = err.get('type')    if isinstance(err, dict) else None
+    print('--- Polaris Iceberg REST loadTable response ---')
+    print('error.code               :', code)
+    print('error.type               :', typ)
+    print('error.message            :', msg)
+    print()
+    print('Verdict for external Iceberg engine readability:')
+    print('   BLOCKED  (Polaris refused loadTable, fail-secure)')
+    print()
+    print('This is the expected response for a Snowflake-managed Iceberg')
+    print('table with row-access or column-mask policies attached. To')
+    print('verify, re-run against a non-policied sibling table; loadTable')
+    print('will return vended creds and a real manifest-list.')
+    sys.exit(0)
+
 cfg = d.get('config') or {}
 sc  = d.get('storage-credentials') or []
 md  = d.get('metadata') or {}
@@ -74,7 +135,9 @@ print('Verdict for external Iceberg engine readability:')
 ok = bool(cfg.get('s3.session-token')) and bool(ml)
 print('  ', 'READABLE'   if ok else 'BLOCKED  (no creds and/or empty manifest-list)')
 print()
-print('Note: even when readable in Phase B, the snapshot pointer should be')
-print('different from the admin-role snapshot because Snowflake serves a')
-print('governed view that reflects the row filter and column masks.')
+print('A READABLE Phase A confirms the wire path works end to end. After')
+print('attaching row-access or masking policies (snowflake/02_apply_policies.sql),')
+print('this same call should return error.code=403 with')
+print('error.type=ForbiddenException -- Polaris fail-secure on the')
+print('policied table.')
 "
