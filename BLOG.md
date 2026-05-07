@@ -1,12 +1,13 @@
-# Open Iceberg, governed: Snowflake Horizon vs Databricks Unity Catalog when an external Spark engine reads a policied table
+# Open Iceberg, governed: Snowflake Horizon vs Databricks Unity Catalog when a foreign engine reads a policied table
 
 > *"Apache Iceberg is open, so my governance plane shouldn't lock me into one
 > compute engine."* — that's the pitch every vendor makes for managed Iceberg
 > these days. This post is a short, reproducible test of how true that
-> actually is, on each of the two main vendors, when you attach
-> fine-grained access controls (row filters and column masks) to an
-> Iceberg table and then read it from OSS Apache Spark via the vendor's
-> Iceberg REST catalog.
+> actually is. We attach the same fine-grained access controls (row
+> filters and column masks) to an Iceberg table on each vendor, and then
+> read the table from a *foreign* engine — first OSS Apache Spark via the
+> vendor's Iceberg REST catalog, and then, on the Snowflake side, from
+> Databricks via Unity Catalog Federation.
 
 The two vendors take fundamentally different approaches and produce
 different observable results — different enough that anyone planning a
@@ -300,6 +301,143 @@ engines are first-class consumers, this needs to be on the table early.
 
 ---
 
+## A twist: Snowflake-policied table read from Databricks via UC Federation
+
+Once you've internalized the difference, the obvious follow-up question
+is the inverse one: if Snowflake is the governance plane and the table
+sits in S3 in a Snowflake-managed Iceberg format, what does *Databricks*
+see when it queries that table?
+
+This matters because Databricks customers don't have to use OSS Spark to
+reach a Snowflake-managed table. UC offers two first-class integrations
+into Snowflake — and they take dramatically different paths to the data.
+
+### Path 1 — Query Federation (JDBC pushdown)
+
+```sql
+CREATE CONNECTION sf_conn TYPE SNOWFLAKE OPTIONS (
+  host        '<account>.snowflakecomputing.com',
+  user        '<user>',
+  password    '<secret>',
+  sfWarehouse '<warehouse>',
+  sfRole      '<restricted_role>'   -- bound to a non-admin role
+);
+
+CREATE FOREIGN CATALOG sf_query_fed USING CONNECTION sf_conn
+  OPTIONS ('database' '<database>');
+```
+
+`DESCRIBE EXTENDED sf_query_fed.public.policy_test_table` shows
+`Provider: snowflake, Type: FOREIGN`. Every `SELECT` is rewritten and
+pushed down over JDBC to a Snowflake virtual warehouse, executes on
+Snowflake compute, and returns the governed result.
+
+```sql
+SELECT * FROM sf_query_fed.public.policy_test_table ORDER BY user_id;
+-- 1  a***@example.com  ***.***.***.10  US  login
+-- 2  b***@example.com  ***.***.***.5   US  login
+-- 3  c***@example.com  ***.***.***.20  CA  vault_open
+```
+
+Three rows, masked. Identical to what Snowflake itself returns to the
+restricted role. Snowflake's policies are honored because Snowflake's
+query engine is in the data path.
+
+### Path 2 — Catalog Federation (direct S3 read)
+
+The DDL is almost identical but adds an `authorized_paths` option, which
+lets UC ask Snowflake for the table's `metadata.json` location and read
+the parquet directly from S3 with its own UC storage credential:
+
+```sql
+CREATE FOREIGN CATALOG sf_catalog_fed USING CONNECTION sf_conn
+  OPTIONS (
+    'database'         '<database>',
+    'authorized_paths' 's3://<external_volume_bucket>/<prefix>/'
+  );
+```
+
+`DESCRIBE EXTENDED sf_catalog_fed.public.policy_test_table` shows
+`Provider: iceberg, Type: EXTERNAL` along with the metadata location
+Snowflake disclosed. The **same SELECT** now returns:
+
+```sql
+SELECT * FROM sf_catalog_fed.public.policy_test_table ORDER BY user_id;
+-- 1  alice@example.com   192.168.1.10    US   login
+-- 2  bob@example.com     10.0.0.5        US   login
+-- 3  carol@example.com   172.16.0.20     CA   vault_open
+-- 4  dave@example.co.uk  203.0.113.42    UK   login
+-- 5  eve@example.de      198.51.100.7    DE   failed_login
+-- 6  frank@example.fr    192.0.2.55      FR   login
+-- 7  grace@example.jp    203.0.113.99    JP   vault_open
+-- 8  heidi@example.au    198.51.100.88   AU   login
+```
+
+All eight rows. Email, unmasked. IP, unmasked. The row filter that
+should have hidden UK / DE / FR / JP / AU is gone. The masking policies
+are gone. The Snowflake table itself hasn't changed; only Databricks's
+access path has.
+
+### Why this happens
+
+Snowflake's row-access policies and masking policies are **query-time**
+rewrites in Snowflake's SQL engine. They are not row-level deletions,
+not column-level encryption, not encoded into the parquet files. The
+parquet files written under the table's external volume contain the
+complete, raw rows — exactly what an admin would see in-warehouse.
+
+Catalog Federation goes around the Snowflake query engine. UC asks
+Snowflake (over the JDBC connection) for the latest `metadata.json`
+location, and Snowflake returns the unredacted path *even when the
+asking role is not in the policies' admin exempt list* — verified
+directly with `SELECT SYSTEM$GET_ICEBERG_TABLE_INFORMATION(...)` under
+both ACCOUNTADMIN and the non-admin role; same path. UC then reads the
+parquet directly using its own storage credential. Snowflake's FGAC
+enforcement is no longer in the path, so it doesn't apply.
+
+This is the architectural inverse of UC's own behavior. UC's Iceberg
+REST endpoint scrubs `loadTable` for policied tables and refuses to
+hand the raw parquet to external readers — fail-secure. Snowflake's
+metadata service does not scrub; it trusts the engine to honor the
+policy at query time, which works for Snowflake compute but not for an
+engine that bypasses the engine.
+
+### Fallback mode is a safety net, not the rule
+
+Databricks documents that some tables fall back from Catalog Federation
+to Query Federation: tables whose metadata location lives outside the
+declared table location, tables whose paths use special characters, and
+a few other criteria. When fallback kicks in, the query goes back over
+JDBC and Snowflake's policies enforce again. So you may see policy
+enforcement even on a foreign catalog you set up for catalog
+federation — and conclude, incorrectly, that the path is safe. It
+isn't; you got lucky on the table layout.
+
+Always check `DESCRIBE EXTENDED <catalog>.<schema>.<table>`. If you see
+`Provider: iceberg`, you're reading parquet directly and Snowflake's
+FGAC is not protecting that path.
+
+### Summary
+
+| Snowflake policy | Direct in Snowflake | Snowflake → OSS Spark via Polaris | Snowflake → Databricks Query Federation | Snowflake → Databricks Catalog Federation |
+|---|---|---|---|---|
+| Row-access policy | Enforced | Enforced (governed snapshot) | Enforced (JDBC pushdown) | **Bypassed** |
+| Email masking policy | Enforced | Enforced | Enforced | **Bypassed** |
+| IP masking policy | Enforced | Enforced | Enforced | **Bypassed** |
+| Provider on Databricks side | n/a | n/a | `snowflake` | `iceberg` |
+
+Customers running Snowflake FGAC and considering Databricks as a reader
+should default to Query Federation, treat Catalog Federation as
+unsuitable for any table whose security depends on row filters or
+column masks, and audit existing Catalog Federation foreign catalogs to
+make sure no policied tables are exposed.
+
+The full DDL, probe queries, and captured run output for this scenario
+are in
+[`snowflake/databricks_federation/`](https://github.com/sfc-gh-palapaty/uc-vs-horizon-iceberg-fgac/tree/main/snowflake/databricks_federation).
+
+---
+
 ## Reproducing the test
 
 Everything in this post is reproducible. The repository
@@ -370,18 +508,60 @@ python3 snowflake/spark_horizon_policy_test.py   # Phase B: 3 rows, MASKED email
 Total elapsed time on each side: well under five minutes, including the
 Spark dependency download.
 
+### Snowflake-from-Databricks federation side
+
+```bash
+# Step 1 (Snowflake): table + policies already exist (snowflake/01_*.sql + 02_*.sql)
+# Step 2 (Databricks SQL editor, as a user with CREATE CONNECTION):
+#   - edit placeholders in snowflake/databricks_federation/01_databricks_query_federation.sql
+#   - run it (creates CONNECTION + FOREIGN CATALOG, no authorized_paths)
+#   - edit placeholders in snowflake/databricks_federation/02_databricks_catalog_federation.sql
+#   - run it (creates a FOREIGN CATALOG with authorized_paths)
+# Step 3 (Databricks SQL editor):
+#   - run snowflake/databricks_federation/03_test_queries.sql against both catalogs
+#   - compare row counts, country histograms, and email/IP columns
+
+# DESCRIBE EXTENDED <catalog>.<schema>.<table> tells you whether you're
+# really exercising catalog federation (Provider: iceberg) or whether UC
+# silently fell back to query federation for that specific table layout
+# (Provider: snowflake). Only tables in iceberg-provider mode actually
+# demonstrate the FGAC bypass.
+```
+
 ---
 
 ## Closing
 
 "Iceberg is open" is true, and "Iceberg is governed" is true on both
 platforms. The interesting question is whether those two things are
-*compatible* on a per-table basis when an external engine is in the
-picture. On Snowflake Horizon they are. On Databricks Unity Catalog they
-are not, today, and the documented behavior makes that explicit. The
-practical effect for anyone planning a multi-engine architecture is that
-the choice of governance plane has direct consequences for which engines
-can read which tables — a choice worth making with eyes open.
+*compatible* on a per-table basis when a foreign engine is in the
+picture, *and* on which side of that engine boundary policies are
+actually enforced.
+
+The two platforms make opposite choices, and both choices have
+consequences:
+
+- **Databricks Unity Catalog** treats the Databricks engine as the
+  enforcement plane. Policied tables are governed inside Databricks,
+  unreadable from an external Iceberg client. Fail-secure to outsiders;
+  closed to multi-engine reads on policied tables.
+- **Snowflake Horizon** treats the data plane as the enforcement plane
+  *for engines that go through Snowflake* (native compute, OSS Spark via
+  Polaris, Databricks Query Federation). Open to multi-engine reads.
+  But that openness has an edge: any path that hands raw S3 access to
+  another engine — like Databricks Catalog Federation — bypasses the
+  policies entirely, because they are query-time constructs and the
+  parquet files have no idea they exist.
+
+The practical takeaway for anyone planning a multi-engine architecture
+is to be explicit about *which engine you trust to enforce policy at
+query time*, and then make sure every read path actually goes through
+that engine. UC gives you that for free if you stay on Databricks
+compute. Snowflake gives you that for free if you stay on Snowflake or
+on engines that talk to it through Snowflake compute (OSS Spark via
+Polaris, Databricks Query Federation). The traps are at the boundaries:
+external Iceberg clients hitting UC's REST endpoint, and Databricks
+Catalog Federation reading Snowflake-managed parquet directly.
 
 ---
 
@@ -390,9 +570,12 @@ can read which tables — a choice worth making with eyes open.
 - Databricks docs — [Row filters and column masks, Limitations](https://docs.databricks.com/aws/en/data-governance/unity-catalog/filters-and-masks#limitations)
 - Databricks docs — [Access Databricks tables from Apache Iceberg clients](https://docs.databricks.com/aws/external-access/iceberg)
 - Databricks docs — [Unity Catalog credential vending for external system access](https://docs.databricks.com/en/external-access/credential-vending)
+- Databricks docs — [What is catalog federation?](https://docs.databricks.com/aws/en/query-federation/catalog-federation)
+- Databricks docs — [Enable Snowflake catalog federation](https://docs.databricks.com/aws/en/query-federation/snowflake-catalog-federation)
 - Databricks KB — [Unauthorized access exception … row filters or column masks](https://kb.databricks.com/en_US/delta/unauthorized-access-exception-when-trying-to-access-a-unity-catalog-table-with-row-filters-or-column-masks)
 - Apache Iceberg — [Issue #10909 "Support row filter & column masking in REST spec"](https://github.com/apache/iceberg/issues/10909) (closed: `not_planned`)
 - Snowflake docs — [Apache Iceberg tables](https://docs.snowflake.com/en/user-guide/tables-iceberg)
+- Snowflake docs — [Row access policies](https://docs.snowflake.com/en/user-guide/security-row-intro)
 - Snowflake docs — [Polaris (open-source) catalog](https://www.snowflake.com/blog/polaris-catalog-iceberg/)
 
 ---

@@ -1,19 +1,22 @@
 # Unity Catalog vs Snowflake Horizon — Iceberg policy enforcement test
 
 Reproducible empirical test of how Databricks Unity Catalog and Snowflake
-Horizon enforce fine-grained access controls on Iceberg tables when those
-tables are read from external engines (OSS Apache Spark) via the
-platforms' respective Iceberg REST catalogs.
+Horizon enforce fine-grained access controls (FGAC — row filters and
+column masks) on Iceberg tables when those tables are read from a
+**different engine** than the one that owns the governance plane:
 
-**TL;DR** — the two systems behave very differently:
+1. Databricks Unity Catalog table accessed by **OSS Apache Spark** via UC's Iceberg REST endpoint.
+2. Snowflake Horizon table accessed by **OSS Apache Spark** via Polaris REST.
+3. Snowflake Horizon table accessed by **Databricks** via UC Federation (both Query Federation and Catalog Federation).
 
-| Capability | Snowflake Horizon (Polaris REST) | Databricks Unity Catalog (Iceberg REST) |
+**TL;DR** — three separate boundaries, three very different outcomes:
+
+| Boundary | Direction | Result |
 |---|---|---|
-| Native compute reads policied table | Filtered + masked rows served | Filtered + masked rows served |
-| External OSS Spark reads policied table | Filtered + masked rows served (server-side enforcement) | **Refused** — empty creds, blank manifest-list, client errors |
-| External engine receives vended credentials | Yes — scoped to the policy's filtered/masked view | No — `config: {}` |
-| External engine receives a real manifest-list | Yes — points at the filtered/masked snapshot | No — `manifest-list: ""` |
-| Posture | Open Iceberg + governed FGAC across engines | Open Iceberg + FGAC only when callers stay on Databricks compute |
+| Databricks UC Iceberg REST → OSS Spark | UC governs, Spark reads | **Fail-secure**: UC returns no vended credentials and a blank `manifest-list`. The external client cannot read the table at all. |
+| Snowflake Polaris → OSS Spark            | Snowflake governs, Spark reads | **Policy-enforcing**: Polaris serves a role-scoped, filtered + masked snapshot to the external client. |
+| Snowflake → Databricks UC **Query Federation** (JDBC pushdown) | Snowflake governs, Databricks reads via Snowflake compute | **Policy-enforcing**: Snowflake's query engine applies the row filter and masks before the result reaches Databricks. |
+| Snowflake → Databricks UC **Catalog Federation** (direct S3 read) | Snowflake governs, Databricks reads parquet directly | **Policies bypassed**: Databricks reads the raw parquet from S3, which contains every row and every cell unmasked. The Snowflake row-access and masking policies are query-time constructs and were never serialized into the files. |
 
 UC's documented limitation, verbatim:
 
@@ -48,12 +51,19 @@ The full write-up, including the field-by-field diff of UC's
     ├── 02_apply_policies.sql                  Define ROW ACCESS / MASKING POLICIES + ALTER ICEBERG TABLE
     ├── 03_drop_policies.sql                   Cleanup
     ├── spark_horizon_policy_test.py           OSS Spark client over Polaris REST
-    └── probe_polaris_iceberg_rest.sh          curl probe of Polaris's loadTable response
+    ├── probe_polaris_iceberg_rest.sh          curl probe of Polaris's loadTable response
+    │
+    └── databricks_federation/                 Databricks-as-the-consumer test
+        ├── README.md                          Test narrative + prereqs
+        ├── 01_databricks_query_federation.sql Databricks DDL: CONNECTION + FOREIGN CATALOG (JDBC pushdown)
+        ├── 02_databricks_catalog_federation.sql Databricks DDL: FOREIGN CATALOG with authorized_paths (direct S3 read)
+        ├── 03_test_queries.sql                Probe queries comparing the two paths side by side
+        └── findings.md                        Captured empirical results — query fed enforces, catalog fed bypasses
 ```
 
-The two sides have intentionally identical shape — same data, same policy
-shapes, same OSS Spark client structure — so the only meaningful
-difference between runs is the platform under test. That's what makes the
+The three sides have intentionally identical shape — same data, same
+policy shapes, same probe queries — so the only meaningful difference
+between runs is the access path under test. That's what makes the
 comparison clean.
 
 ## Common prerequisites for both sides
@@ -140,9 +150,39 @@ python3 snowflake/spark_horizon_policy_test.py        # Expect: 3 rows, MASKED e
 #    -> snowflake/03_drop_policies.sql
 ```
 
+## Running the Snowflake-from-Databricks federation test
+
+This third scenario asks: with Snowflake's FGAC policies attached, what
+does Databricks see when it accesses the same table via UC Federation?
+There are two distinct integrations to test, and they behave very
+differently. Full details, prerequisites, and DDL are in
+[`snowflake/databricks_federation/README.md`](snowflake/databricks_federation/README.md);
+empirical run output is in
+[`snowflake/databricks_federation/findings.md`](snowflake/databricks_federation/findings.md).
+
+In short:
+
+```bash
+# Snowflake side already has the policied table (snowflake/01_*.sql + 02_*.sql).
+
+# Databricks side: open SQL editor as a metastore admin / CREATE CONNECTION user.
+# Edit placeholders in:
+#   snowflake/databricks_federation/01_databricks_query_federation.sql
+#   snowflake/databricks_federation/02_databricks_catalog_federation.sql
+# Run them in order, then run:
+#   snowflake/databricks_federation/03_test_queries.sql
+```
+
+Expected behavior:
+- The **query-fed** catalog (`Provider: snowflake` in `DESCRIBE EXTENDED`)
+  returns 3 rows, masked — Snowflake enforced the policies.
+- The **catalog-fed** catalog (`Provider: iceberg` in `DESCRIBE EXTENDED`)
+  returns all 8 rows, **unmasked** — direct parquet read from S3 bypassed
+  Snowflake's policy enforcement entirely.
+
 ## Reading the results
 
-The two Phase B outcomes side by side are the headline:
+The Phase B outcomes for the original two-sided OSS-Spark test:
 
 |                                  | Snowflake Horizon, restricted role     | Databricks Unity Catalog, non-admin caller |
 |---                               |---                                     |---                                          |
@@ -154,6 +194,17 @@ Both platforms have the same in-engine UX (admins see everything,
 non-admins see filtered + masked). The difference is at the external
 engine boundary: Snowflake serves the governed view, Databricks blocks
 external readability entirely.
+
+The federation test extends this with a third row: when Snowflake is the
+governance plane and Databricks is the reader, the **integration mode you
+pick matters more than the policies you wrote**.
+
+|                                          | Snowflake → Databricks Query Federation | Snowflake → Databricks Catalog Federation |
+|---                                       |---                                      |---                                         |
+| Provider in `DESCRIBE EXTENDED`          | `snowflake`                             | `iceberg`                                  |
+| Where the query runs                     | Snowflake virtual warehouse (JDBC push) | Databricks compute                         |
+| Snowflake row-access policy honored?     | Yes (3/8 rows visible)                  | No (8/8 rows visible)                      |
+| Snowflake column-mask policies honored?  | Yes (`a***@example.com`, `***.***.***.10`) | No (raw `alice@example.com`, raw `192.168.1.10`) |
 
 ## License
 
