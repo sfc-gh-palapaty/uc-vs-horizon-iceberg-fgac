@@ -14,7 +14,7 @@ column masks) on Iceberg tables when those tables are read from a
 | Boundary | Direction | Result |
 |---|---|---|
 | Databricks UC Iceberg REST → OSS Spark | UC governs, Spark reads | **Fail-secure**: UC returns no vended credentials and a blank `manifest-list`. The external client cannot read the table at all. |
-| Snowflake Polaris → OSS Spark            | Snowflake governs, Spark reads | **Policy-enforcing**: Polaris serves a role-scoped, filtered + masked snapshot to the external client. |
+| Snowflake Horizon → OSS Spark            | Snowflake governs, Spark reads | **Policy-enforcing**: Polaris serves a role-scoped, filtered + masked snapshot to the external client. |
 | Snowflake → Databricks UC **Query Federation** (JDBC pushdown) | Snowflake governs, Databricks reads via Snowflake compute | **Policy-enforcing**: Snowflake's query engine applies the row filter and masks before the result reaches Databricks. |
 | Snowflake → Databricks UC **Catalog Federation** (direct S3 read) | Snowflake governs, Databricks reads parquet directly | **Policies bypassed**: Databricks reads the raw parquet from S3, which contains every row and every cell unmasked. The Snowflake row-access and masking policies are query-time constructs and were never serialized into the files. |
 
