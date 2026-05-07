@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Databricks Unity Catalog vs Snowflake Horizon &mdash; Iceberg Policy Enforcement</title>
+<style>
+  @page { size: Letter; margin: 0.75in 0.75in 0.9in 0.75in;
+          @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 9pt; color: #666; } }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+         font-size: 10.5pt; line-height: 1.45; color: #1a1a1a; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; color: #0a2540; letter-spacing: -0.3pt;}
+  h1 + p.subtitle { color: #555; margin: 0 0 18pt; font-size: 11pt; }
+  h2 { font-size: 14pt; margin-top: 22pt; margin-bottom: 6pt; color: #0a2540;
+       border-bottom: 1pt solid #d0d7e2; padding-bottom: 3pt; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin-top: 14pt; margin-bottom: 4pt; color: #0a2540; page-break-after: avoid; }
+  p, li { font-size: 10.5pt; }
+  ul, ol { padding-left: 18pt; }
+  li { margin-bottom: 2pt; }
+  code { font-family: "SF Mono", "Menlo", "Consolas", monospace; font-size: 9.2pt;
+         background: #f3f5f8; padding: 0.5pt 3pt; border-radius: 2pt; }
+  pre { font-family: "SF Mono", "Menlo", "Consolas", monospace; font-size: 8.6pt;
+        background: #0f172a; color: #e2e8f0; padding: 9pt 11pt; border-radius: 4pt;
+        line-height: 1.35; overflow-x: auto; white-space: pre; page-break-inside: avoid; }
+  pre.sql { background: #f8fafc; color: #0f172a; border: 1pt solid #d0d7e2; }
+  table { border-collapse: collapse; width: 100%; font-size: 9.5pt; margin: 8pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1pt solid #d0d7e2; padding: 5pt 7pt; vertical-align: top; text-align: left; }
+  th { background: #eef2f7; font-weight: 600; color: #0a2540; }
+  tr.bad td:nth-child(3) { color: #b91c1c; font-weight: 600; }
+  tr.good td:nth-child(2) { color: #047857; font-weight: 600; }
+  .callout { border-left: 3pt solid #0a2540; background: #f3f5f8; padding: 8pt 12pt;
+             margin: 10pt 0; border-radius: 0 4pt 4pt 0; page-break-inside: avoid; }
+  .callout.warn { border-left-color: #b91c1c; background: #fef2f2; }
+  .callout.good { border-left-color: #047857; background: #ecfdf5; }
+  .meta { font-size: 9.5pt; color: #555; }
+  .meta dt { font-weight: 600; color: #0a2540; float: left; clear: left; min-width: 8em; }
+  .meta dd { margin: 0 0 2pt 9em; }
+  .footer-note { font-size: 8.5pt; color: #555; margin-top: 16pt; border-top: 1pt solid #d0d7e2; padding-top: 6pt; }
+  .verdict { display: inline-block; padding: 1pt 6pt; border-radius: 3pt;
+             font-weight: 600; font-size: 9pt; }
+  .verdict.bad  { background: #fee2e2; color: #b91c1c; }
+  .verdict.good { background: #d1fae5; color: #047857; }
+  .nobreak { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<h1>Databricks Unity Catalog vs Snowflake Horizon</h1>
+<p class="subtitle">Empirical test of Iceberg fine-grained access&#8209;control enforcement when a Databricks Unity Catalog&#8209;managed Iceberg table is read from OSS Spark via the Unity Catalog Iceberg REST endpoint.</p>
+
+<dl class="meta">
+  <dt>Date</dt>             <dd>2026-05-06</dd>
+  <dt>Workspace DBR</dt>    <dd>16.4 LTS+ (Databricks Unity Catalog Iceberg REST is GA / Public Preview from 16.4)</dd>
+  <dt>External client</dt>  <dd>OSS PySpark 3.5 + <code>iceberg-spark-runtime-3.5_2.12:1.9.1</code> + <code>iceberg-aws-bundle:1.9.1</code></dd>
+  <dt>Auth to Databricks Unity Catalog</dt>        <dd>Bearer token (PAT or OAuth) via the Databricks Unity Catalog Iceberg REST endpoint</dd>
+</dl>
+
+<h2>1. Question under test</h2>
+<p>A reference Snowflake Horizon test (<code>spark_horizon_policy_test.py</code>) shows that when a Snowflake&#8209;managed Iceberg table has a row access policy and column masks attached, an external OSS Spark client connecting via the Polaris REST catalog with vended credentials still receives a fully <em>governed</em> view of the table: filtered rows, masked columns, served from Snowflake&#8217;s data plane.</p>
+<p>Question:</p>
+<div class="callout">
+  &ldquo;Is the same true for a Databricks&#8209;managed Iceberg table accessed from OSS Spark via Unity Catalog&#8217;s Iceberg REST endpoint? If we attach a Databricks Unity Catalog row filter and column masks, will an external Spark client still get the governed view of the data?&rdquo;
+</div>
+<p>The short answer is <strong>no</strong>, and the failure mode is materially different from what most reviewers expect. Databricks Unity Catalog does not enforce policy server&#8209;side &mdash; it cannot, the engine on the other end is OSS Spark reading parquet directly from S3. Instead, the moment any row filter or column mask is attached, Databricks Unity Catalog <em>scrubs its REST response</em> so the external client has nothing readable. The net effect is that the table becomes unreadable from any non&#8209;Databricks engine.</p>
+
+<h2>2. Documented behavior (Databricks)</h2>
+<p>From the Databricks documentation page <em>&ldquo;Row filters and column masks&rdquo;</em>, Limitations section:</p>
+<div class="callout warn">
+  &ldquo;You cannot use Iceberg REST catalog or Unity REST APIs to access tables with row filters or column masks.&rdquo;
+  <br/><span class="meta">&mdash; <code>docs.databricks.com/aws/en/data-governance/unity-catalog/filters-and-masks#limitations</code></span>
+</div>
+<p>And from the Databricks Knowledge Base article on Databricks Unity Catalog FGAC:</p>
+<div class="callout warn">
+  &ldquo;<code>[UNAUTHORIZED_ACCESS] Path-based access to table &lt;catalog&gt;.&lt;schema&gt;.&lt;table&gt; with row filter or column mask not supported.</code> &hellip; Only name&#8209;based access (<code>catalog.schema.table</code>) is allowed.&rdquo;
+  <br/><span class="meta">&mdash; <code>kb.databricks.com</code> &ndash; &ldquo;Unauthorized access exception &hellip; row filters or column masks&rdquo;</span>
+</div>
+<p>The test below operationally verifies this behavior and characterizes the actual failure mechanism, which is more nuanced than the docs convey.</p>
+
+<h2>3. Test environment</h2>
+<table>
+  <tr><th>Component</th><th>Value</th></tr>
+  <tr><td>Catalog / schema / table</td><td><code>&lt;catalog&gt;.policy_test.policy_test_table</code></td></tr>
+  <tr><td>Securable kind</td><td><code>TABLE_DELTA_ICEBERG_MANAGED</code> &mdash; Databricks Unity Catalog&#8209;managed Iceberg, created with <code>USING ICEBERG</code></td></tr>
+  <tr><td>Storage</td><td>Databricks Unity Catalog&#8209;managed S3 path (workspace bucket, Databricks Unity Catalog owns the layout)</td></tr>
+  <tr><td>External client</td><td>OSS PySpark 3.5 / Java 11, <code>iceberg-spark-runtime-3.5_2.12:1.9.1</code> + <code>iceberg-aws-bundle:1.9.1</code></td></tr>
+  <tr><td>Catalog endpoint</td><td><code>&lt;workspace&gt;/api/2.1/unity-catalog/iceberg-rest</code></td></tr>
+  <tr><td>Vended credentials</td><td>Header <code>X-Iceberg-Access-Delegation: vended-credentials</code></td></tr>
+  <tr><td>Authentication</td><td>Bearer token (PAT or OAuth)</td></tr>
+  <tr><td>Privileges of caller</td><td><code>USE CATALOG</code>, <code>USE SCHEMA</code>, <code>SELECT</code>, <code>EXTERNAL USE SCHEMA</code> on the schema</td></tr>
+  <tr><td>FGAC functions</td><td><code>row_filter_us_ca</code>, <code>mask_email</code>, <code>mask_ip</code> (SQL UDFs, group&#8209;exempt for <code>admins</code> / <code>analytics_admin</code>)</td></tr>
+</table>
+<p>The caller is intentionally <em>not</em> a member of <code>admins</code> or <code>analytics_admin</code>, so the policies actively apply. This was confirmed by the Databricks SQL warehouse query in Phase B (3 rows, masked).</p>
+
+<h2>4. Methodology</h2>
+<ol>
+  <li><strong>Phase A &mdash; baseline:</strong> create the table, load 8 rows, attach <em>no</em> policies. Read the table from Databricks SQL <em>and</em> from OSS Spark via Databricks Unity Catalog Iceberg REST. Both should succeed and return the same raw 8 rows.</li>
+  <li><strong>Apply FGAC:</strong> attach <code>row_filter_us_ca</code> on <code>country</code>, <code>mask_email</code> on <code>email</code>, <code>mask_ip</code> on <code>ip_address</code>.</li>
+  <li><strong>Phase B &mdash; under policy:</strong> re&#8209;read the same table from Databricks SQL (expected: 3 rows, masked) <em>and</em> from OSS Spark (expected: failure or empty result).</li>
+  <li><strong>Forensic probe:</strong> for each phase, hit the Databricks Unity Catalog Iceberg REST <code>loadTable</code> endpoint directly with <code>curl</code> and inspect the JSON response. This is what reveals the <em>mechanism</em> of Databricks Unity Catalog&#8217;s &ldquo;fail&#8209;secure&rdquo; behavior.</li>
+</ol>
+
+<h2>5. Test data &amp; FGAC functions</h2>
+
+<pre class="sql">CREATE TABLE &lt;catalog&gt;.policy_test.policy_test_table (
+  user_id     BIGINT,
+  email       STRING,
+  ip_address  STRING,
+  country     STRING,
+  event_type  STRING
+) USING ICEBERG;
+
+INSERT INTO &lt;catalog&gt;.policy_test.policy_test_table VALUES
+  (1,'alice@example.com',  '192.168.1.10', 'US','login'),
+  (2,'bob@example.com',    '10.0.0.5',     'US','login'),
+  (3,'carol@example.com',  '172.16.0.20',  'CA','vault_open'),
+  (4,'dave@example.co.uk', '203.0.113.42', 'UK','login'),
+  (5,'eve@example.de',     '198.51.100.7', 'DE','failed_login'),
+  (6,'frank@example.fr',   '192.0.2.55',   'FR','login'),
+  (7,'grace@example.jp',   '203.0.113.99', 'JP','vault_open'),
+  (8,'heidi@example.au',   '198.51.100.88','AU','login');</pre>
+
+<pre class="sql">CREATE OR REPLACE FUNCTION row_filter_us_ca(country STRING) RETURNS BOOLEAN
+RETURN is_account_group_member('admins')
+    OR is_account_group_member('analytics_admin')
+    OR country IN ('US','CA');
+
+CREATE OR REPLACE FUNCTION mask_email(email STRING) RETURNS STRING
+RETURN CASE
+  WHEN is_account_group_member('admins')
+    OR is_account_group_member('analytics_admin') THEN email
+  WHEN email IS NULL OR instr(email,'@')=0        THEN email
+  ELSE concat(substring(email,1,1), '***', substring(email, instr(email,'@')))
+END;
+
+CREATE OR REPLACE FUNCTION mask_ip(ip STRING) RETURNS STRING
+RETURN CASE
+  WHEN is_account_group_member('admins')
+    OR is_account_group_member('analytics_admin') THEN ip
+  WHEN ip IS NULL THEN ip
+  ELSE concat('***.***.***.', element_at(split(ip,'\\.'),-1))
+END;
+
+ALTER TABLE policy_test_table SET ROW FILTER row_filter_us_ca ON (country);
+ALTER TABLE policy_test_table ALTER COLUMN email      SET MASK mask_email;
+ALTER TABLE policy_test_table ALTER COLUMN ip_address SET MASK mask_ip;</pre>
+
+<h2>6. Results</h2>
+
+<h3>6.1 Phase A &mdash; no policies attached</h3>
+
+<p><strong>Databricks SQL warehouse</strong> (non&#8209;admin caller):</p>
+<pre>user_id  email                 ip_address      country  event_type
+1        alice@example.com     192.168.1.10    US       login
+2        bob@example.com       10.0.0.5        US       login
+3        carol@example.com     172.16.0.20     CA       vault_open
+4        dave@example.co.uk    203.0.113.42    UK       login
+5        eve@example.de        198.51.100.7    DE       failed_login
+6        frank@example.fr      192.0.2.55      FR       login
+7        grace@example.jp      203.0.113.99    JP       vault_open
+8        heidi@example.au      198.51.100.88   AU       login</pre>
+
+<p><strong>OSS Spark via Databricks Unity Catalog Iceberg REST</strong> (<code>spark_uc_policy_test.py</code>):</p>
+<pre>+-------+-------------------+-------------+-------+------------+
+|user_id|email              |ip_address   |country|event_type  |
++-------+-------------------+-------------+-------+------------+
+|1      |alice@example.com  |192.168.1.10 |US     |login       |
+|2      |bob@example.com    |10.0.0.5     |US     |login       |
+|3      |carol@example.com  |172.16.0.20  |CA     |vault_open  |
+|4      |dave@example.co.uk |203.0.113.42 |UK     |login       |
+|5      |eve@example.de     |198.51.100.7 |DE     |failed_login|
+|6      |frank@example.fr   |192.0.2.55   |FR     |login       |
+|7      |grace@example.jp   |203.0.113.99 |JP     |vault_open  |
+|8      |heidi@example.au   |198.51.100.88|AU     |login       |
++-------+-------------------+-------------+-------+------------+
+Rows returned: 8 ; email masked? False ; ip masked? False</pre>
+
+<p><strong>Forensic probe of the Databricks Unity Catalog Iceberg REST <code>loadTable</code> response:</strong></p>
+<pre>config keys              : ['client.region', 's3.access-key-id', 's3.secret-access-key',
+                            's3.session-token', 's3.session-token-expires-at-ms']
+vended S3 access-key-id  : PRESENT
+vended S3 session-token  : PRESENT
+storage-credentials count: 0
+snapshot.manifest-list   : 's3://&lt;workspace-bucket&gt;/&hellip;/_iceberg/metadata/snap-&hellip;.avro'
+Verdict: <span class="verdict good">READABLE</span></pre>
+
+<p>Databricks Unity Catalog vends short&#8209;lived S3 credentials in the <code>config</code> block and returns the real manifest&#8209;list pointer. Spark&#8217;s Iceberg client uses the credentials to read the manifest list, plan the scan, fetch parquet data files, and return rows.</p>
+
+<h3>6.2 Phase B &mdash; row filter and column masks attached</h3>
+
+<p><strong>Databricks SQL warehouse</strong> (same caller):</p>
+<pre>user_id  email                  ip_address          country  event_type
+1        a***@example.com       ***.***.***.10      US       login
+2        b***@example.com       ***.***.***.5       US       login
+3        c***@example.com       ***.***.***.20      CA       vault_open</pre>
+<p>Databricks Unity Catalog enforces the row filter and column masks on Databricks compute: 3 of 8 rows survive, <code>email</code> and <code>ip_address</code> are masked. Databricks Unity Catalog&#8217;s name&#8209;based, in&#8209;engine policy enforcement is working as documented.</p>
+
+<p><strong>OSS Spark via Databricks Unity Catalog Iceberg REST</strong> (same client, same script):</p>
+<pre>QUERY FAILED: Py4JJavaError: An error occurred while calling o62.showString.
+: org.apache.iceberg.exceptions.ValidationException:
+        Invalid S3 URI, cannot determine scheme:
+    at org.apache.iceberg.aws.s3.S3URI.&lt;init&gt;(S3URI.java:75)
+    at org.apache.iceberg.aws.s3.S3InputFile.fromLocation(S3InputFile.java:41)
+    at org.apache.iceberg.aws.s3.S3FileIO.newInputFile(S3FileIO.java:176)
+    at org.apache.iceberg.BaseSnapshot.cacheManifests(BaseSnapshot.java:176)
+    at org.apache.iceberg.BaseSnapshot.deleteManifests(BaseSnapshot.java:210)
+    at org.apache.iceberg.BaseDistributedDataScan.findMatchingDeleteManifests &hellip;</pre>
+
+<p><strong>Forensic probe of the Databricks Unity Catalog Iceberg REST <code>loadTable</code> response:</strong></p>
+<pre>config keys              : []
+vended S3 access-key-id  : ABSENT
+vended S3 session-token  : ABSENT
+storage-credentials count: 0
+snapshot.manifest-list   : ''
+Verdict: <span class="verdict bad">BLOCKED  (no creds and/or empty manifest-list)</span></pre>
+
+<p>This is the punchline. The HTTP 200 response still carries a <code>metadata-location</code> pointer, but every actionable field has been redacted by Databricks Unity Catalog:</p>
+<ul>
+  <li><code>config</code> is an empty object &ndash; <strong>no vended S3 credentials</strong>.</li>
+  <li><code>storage-credentials</code> is an empty array.</li>
+  <li>The latest snapshot&#8217;s <code>manifest-list</code> is the <strong>empty string</strong> <code>""</code>.</li>
+</ul>
+<p>The Iceberg client on the OSS Spark side trusts the response, sees an empty&#8209;string manifest&#8209;list, and tries to construct an <code>S3URI</code> from it &mdash; which fails synchronously with <code>Invalid S3 URI, cannot determine scheme:</code> (note the trailing colon and empty value). That is the exception you see at runtime.</p>
+
+<h2>7. Mechanism &mdash; how Databricks Unity Catalog blocks external readers</h2>
+
+<p>Databricks Unity Catalog has no way to enforce a row filter or a column mask on an OSS Spark client. The client connects to a REST endpoint, gets a metadata pointer plus credentials, and from that point on reads parquet directly from S3 without Databricks Unity Catalog ever seeing the read. Databricks Unity Catalog has only one moment of control &mdash; the <code>loadTable</code> response &mdash; and on policied tables it uses that moment to remove every piece of information the client needs:</p>
+
+<table>
+  <tr><th>Field in <code>loadTable</code> response</th><th>Phase A (no policies)</th><th>Phase B (policies on)</th></tr>
+  <tr class="bad"><td><code>config.s3.access-key-id</code></td><td>PRESENT</td><td>ABSENT</td></tr>
+  <tr class="bad"><td><code>config.s3.session-token</code></td><td>PRESENT</td><td>ABSENT</td></tr>
+  <tr class="bad"><td><code>config.client.region</code></td><td>PRESENT</td><td>ABSENT</td></tr>
+  <tr class="bad"><td><code>storage-credentials[]</code></td><td>(empty &mdash; creds in <code>config</code>)</td><td>empty</td></tr>
+  <tr class="bad"><td><code>metadata.snapshots[-1].manifest-list</code></td><td>real S3 path (265 chars)</td><td>empty string <code>""</code></td></tr>
+  <tr><td><code>metadata-location</code></td><td>real S3 path</td><td>real S3 path (kept, but useless without creds)</td></tr>
+</table>
+
+<div class="callout warn">
+  <strong>Key observation.</strong> Databricks Unity Catalog&#8217;s policy enforcement model for external engines is &ldquo;refuse to give them anything they can use&rdquo;. It is <em>not</em> &ldquo;return data with the policy applied,&rdquo; which is what Snowflake Horizon does. Functionally the table becomes unreadable from any non&#8209;Databricks Iceberg client (OSS Spark, Trino, Flink, PyIceberg, Snowflake catalog&#8209;linked databases, etc.) for as long as the policy is attached.
+</div>
+
+<h2>8. Side&#8209;by&#8209;side comparison with Snowflake Horizon</h2>
+
+<table>
+  <tr><th>Capability</th><th>Snowflake Horizon (Polaris REST)</th><th>Databricks Unity Catalog (Iceberg REST)</th></tr>
+  <tr><td>Native compute reads policied table</td><td>Filtered + masked rows served</td><td>Filtered + masked rows served</td></tr>
+  <tr class="bad"><td>External OSS Spark reads policied table</td><td>Filtered + masked rows served (server&#8209;side enforcement)</td><td>Refused &mdash; empty creds, blank manifest&#8209;list, client errors</td></tr>
+  <tr class="bad"><td>External engine receives vended credentials</td><td>Yes &mdash; scoped to the policy&#8217;s filtered/masked view</td><td>No &mdash; <code>config: {}</code></td></tr>
+  <tr class="bad"><td>External engine receives a real manifest&#8209;list</td><td>Yes &mdash; points at the filtered/masked snapshot</td><td>No &mdash; <code>manifest-list: ""</code></td></tr>
+  <tr><td>Governance posture</td><td>Open Iceberg + governed FGAC across engines</td><td>Open Iceberg + FGAC only when callers stay on Databricks compute</td></tr>
+  <tr><td>Net result for multi&#8209;engine architectures</td><td>Single governance plane, all engines see the same governed view</td><td>Either&#8209;or: governance <em>or</em> openness, not both, on a per&#8209;table basis</td></tr>
+</table>
+
+<h2>9. Implications</h2>
+<ul>
+  <li>Any architecture that relies on Databricks Unity Catalog FGAC for sensitive tables and also expects external engines (OSS Spark on EMR, Trino, Flink, PyIceberg, Snowflake via catalog&#8209;linked databases, ad&#8209;hoc PyIceberg in scripts) to read those same tables is structurally incompatible with Databricks Unity Catalog today. The two requirements cannot both be satisfied.</li>
+  <li>The failure mode is silent at the HTTP level: <code>loadTable</code> returns 200 OK. Operators looking at REST traffic will not see a 403, they will see a successful response that just happens to contain no usable data. Diagnostics will surface only on the client (e.g.&nbsp;<code>Invalid S3 URI</code>) and will look like a client&#8209;side bug rather than an authorization decision.</li>
+  <li>Workarounds (use a dynamic view; copy the table to an unmasked external location; expose only Databricks compute to consumers) re&#8209;introduce the duplication and surface area that motivated putting FGAC on the base table in the first place.</li>
+  <li>By contrast, Snowflake Horizon&#8217;s model treats the data plane as the enforcement plane. Any external Iceberg client gets the governed view of the table, identical to native compute. Multi&#8209;engine and FGAC are not mutually exclusive.</li>
+</ul>
+
+<h2>10. Reproducing the test</h2>
+<p>The test bundle on GitHub contains symmetric Databricks and Snowflake
+sides so the same shape of test can be run against both platforms:</p>
+<table>
+  <tr><th>Databricks side (<code>databricks/</code>)</th><th>Snowflake side (<code>snowflake/</code>)</th></tr>
+  <tr><td><code>01_setup_table_and_data.sql</code></td><td><code>01_setup_table_and_data.sql</code></td></tr>
+  <tr><td><code>02_apply_row_filter_and_masks.sql</code></td><td><code>02_apply_policies.sql</code></td></tr>
+  <tr><td><code>03_drop_policies.sql</code></td><td><code>03_drop_policies.sql</code></td></tr>
+  <tr><td><code>spark_uc_policy_test.py</code></td><td><code>spark_horizon_policy_test.py</code></td></tr>
+  <tr><td><code>probe_uc_iceberg_rest.sh</code></td><td><code>probe_polaris_iceberg_rest.sh</code></td></tr>
+</table>
+
+<p>Repro outline (Databricks side; the Snowflake side is in the
+companion <code>BLOG.md</code> and has equivalent shape):</p>
+<pre class="sql"># Step 1 (Databricks SQL editor):
+\i databricks/01_setup_table_and_data.sql
+
+# Step 2 (laptop):
+export DATABRICKS_HOST=https://&lt;your-workspace&gt;.cloud.databricks.com
+export DATABRICKS_TOKEN=&lt;personal-access-token-or-oauth-bearer&gt;
+export UC_CATALOG=&lt;your-catalog&gt;
+export JAVA_HOME=$(/usr/libexec/java_home -v 11)
+
+python3 databricks/spark_uc_policy_test.py    # Phase A: 8 rows, raw
+./databricks/probe_uc_iceberg_rest.sh         # Phase A: READABLE
+
+# Step 3 (Databricks SQL editor):
+\i databricks/02_apply_row_filter_and_masks.sql
+
+python3 databricks/spark_uc_policy_test.py    # Phase B: ValidationException: Invalid S3 URI
+./databricks/probe_uc_iceberg_rest.sh         # Phase B: BLOCKED (no creds, empty manifest-list)
+
+# Optional cleanup:
+\i databricks/03_drop_policies.sql</pre>
+
+<h2>11. References</h2>
+<ul>
+  <li>Databricks &mdash; Row filters and column masks &mdash; Limitations:
+      <code>docs.databricks.com/aws/en/data-governance/unity-catalog/filters-and-masks#limitations</code></li>
+  <li>Databricks &mdash; Access Databricks tables from Apache Iceberg clients:
+      <code>docs.databricks.com/aws/external-access/iceberg</code></li>
+  <li>Databricks &mdash; Unity Catalog credential vending for external system access:
+      <code>docs.databricks.com/en/external-access/credential-vending</code></li>
+  <li>Databricks KB &mdash; Unauthorized access exception &hellip; row filters or column masks:
+      <code>kb.databricks.com/en_US/delta/unauthorized-access-exception-when-trying-to-access-a-unity-catalog-table-with-row-filters-or-column-masks</code></li>
+  <li>Apache Iceberg &mdash; Issue #10909 &ldquo;Support row filter &amp; column masking in REST spec&rdquo; (closed: <em>not_planned</em>):
+      <code>github.com/apache/iceberg/issues/10909</code></li>
+</ul>
+
+<p class="footer-note">All command output and REST payloads quoted in this document were captured live from a Databricks workspace running the test bundle described in section&nbsp;10.</p>
+
+</body>
+</html>
